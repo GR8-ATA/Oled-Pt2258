@@ -1,0 +1,549 @@
+/*
+ * ============================================================================
+ *  Digital 5.1 Channel Volume Controller
+ *  MCU:        Arduino Nano (ATmega328P)
+ *  Volume IC:  PT2258 (6-channel electronic volume controller, I2C)
+ *  Display:    SSD1306 128x64 OLED (I2C)
+ *  Input:      5 push buttons, IR remote (NEC), 5-stage voltage divider (A0)
+ *  Output:     Power relay
+ *
+ *  Features
+ *   - Independent per-channel attenuation (0..79 dB) for all 6 channels
+ *   - Master volume (global attenuation) via PT2258 master register
+ *   - Channel select cycles: MASTER -> FL -> FR -> CENTER -> SUB -> RL -> RR
+ *   - Mute / Unmute (all channels)
+ *   - Power button toggles the output relay + soft state
+ *   - IR remote control (master + each channel) - NEC protocol
+ *   - Serial "learning mode" to capture your own remote's raw hex codes
+ *   - 5-stage voltage divider on A0 -> shows a text label (source/mode)
+ *   - Settings persisted to EEPROM (restored on power up)
+ *
+ *  I2C addresses
+ *   - PT2258 : 0x44 (7-bit)  == 0x88 write / 0x89 read  (CODE1/CODE2 low)
+ *   - SSD1306: 0x3C (7-bit)
+ *
+ *  Libraries (install via Arduino Library Manager)
+ *   - Adafruit GFX Library
+ *   - Adafruit SSD1306
+ *   - IRremote  (v4.x by Armin Joachimsmeyer)
+ * ============================================================================
+ */
+
+#include <Wire.h>
+#include <EEPROM.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---- IRremote v4.x -----------------------------------------------------------
+#define DECODE_NEC          // enable only NEC to save flash
+#include <IRremote.hpp>
+
+// ============================================================================
+//  PIN MAP  (Arduino Nano)
+// ============================================================================
+//  I2C: A4 = SDA, A5 = SCL  (shared by PT2258 + OLED)
+#define PIN_IR_RECV      2   // IR receiver signal (TSOP1738 / VS1838B)
+#define PIN_BTN_VOL_UP   3
+#define PIN_BTN_VOL_DN   4
+#define PIN_BTN_CH_SEL   5
+#define PIN_BTN_MUTE     6
+#define PIN_BTN_POWER    7
+#define PIN_RELAY        8   // output relay (active HIGH by default)
+#define PIN_VDIV         A0  // 5-stage voltage divider input
+
+#define RELAY_ACTIVE_HIGH  true   // set false if your relay board is active LOW
+
+// ============================================================================
+//  OLED
+// ============================================================================
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
+#define OLED_ADDR      0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ============================================================================
+//  PT2258 - register command bases (datasheet)
+//  Attenuation = tens_register(0..7) + units_register(0..9), total 0..79 dB
+//  0 dB  = loudest,  79 dB = quietest
+// ============================================================================
+#define PT2258_ADDR        0x44   // 7-bit (0x88 write)
+
+#define PT2258_CLEAR       0xC0   // clear register (must be sent once at start)
+#define PT2258_MUTE        0xF8   // +0 = unmute all, +1 = mute all
+
+// Per-channel {10dB step base, 1dB step base}
+// Channel order per datasheet: CH1..CH6
+static const uint8_t PT_CH_10DB[6] = { 0x80, 0x40, 0x00, 0x20, 0x60, 0xA0 };
+static const uint8_t PT_CH_1DB [6] = { 0x90, 0x50, 0x10, 0x30, 0x70, 0xB0 };
+
+// Master
+#define PT2258_MASTER_10DB 0xD0
+#define PT2258_MASTER_1DB  0xE0
+
+// ============================================================================
+//  Channel model
+//  We map the 6 PT2258 channels to a 5.1 speaker layout.
+//  index 0..5 -> physical channels ; "MASTER" is a 7th virtual selection.
+// ============================================================================
+enum { CH_FL = 0, CH_FR, CH_CENTER, CH_SUB, CH_RL, CH_RR, CH_COUNT };
+#define SEL_MASTER   CH_COUNT      // 6 == master
+#define SEL_COUNT    (CH_COUNT + 1)
+
+const char* CH_NAME[SEL_COUNT] = {
+  "FRONT L",   // CH_FL
+  "FRONT R",   // CH_FR
+  "CENTER",    // CH_CENTER
+  "SUB",       // CH_SUB
+  "REAR L",    // CH_RL
+  "REAR R",    // CH_RR
+  "MASTER"     // SEL_MASTER
+};
+
+// ============================================================================
+//  5-STAGE VOLTAGE DIVIDER -> text labels  (EDIT THESE to your needs)
+//  Reads A0 (0..1023). Five roughly-even bands are decoded to a label.
+//  Example use: input source selector, listening mode, etc.
+// ============================================================================
+const char* VDIV_LABELS[5] = {
+  "AUX",       // ~0.0 - 1.0 V
+  "BLUETOOTH", // ~1.0 - 2.0 V
+  "USB",       // ~2.0 - 3.0 V
+  "OPTICAL",   // ~3.0 - 4.0 V
+  "COAXIAL"    // ~4.0 - 5.0 V
+};
+// ADC thresholds (0..1023). Value below threshold[i] -> band i.
+// Defaults assume 5 evenly spaced steps of a resistor ladder.
+const int VDIV_THRESHOLD[5] = { 102, 307, 512, 717, 1023 };
+
+// ============================================================================
+//  Persisted settings (EEPROM)
+// ============================================================================
+#define EEPROM_MAGIC   0x51        // bump to reset stored config
+#define EEPROM_ADDR    0
+
+struct Settings {
+  uint8_t magic;
+  uint8_t chAtten[CH_COUNT];   // per-channel attenuation 0..79
+  uint8_t masterAtten;         // master attenuation 0..79
+  uint8_t muted;               // 0/1
+  uint8_t powerOn;             // 0/1
+};
+Settings cfg;
+
+// ============================================================================
+//  Runtime state
+// ============================================================================
+uint8_t selection = SEL_MASTER;   // currently selected channel (for +/-)
+uint8_t vdivBand  = 0;            // decoded voltage divider band
+bool    dirty     = false;        // settings changed -> schedule EEPROM save
+unsigned long lastSaveReq = 0;
+
+// ============================================================================
+//  IR CODE MAP  (NEC command bytes)
+//  These are PLACEHOLDER values for a common NEC remote.
+//  Use the Serial "learning mode" (send 'L') to print your remote's codes,
+//  then paste the printed command values below and re-upload.
+// ============================================================================
+#define IR_POWER      0x45
+#define IR_MUTE       0x47
+#define IR_VOL_UP     0x40
+#define IR_VOL_DN     0x19
+#define IR_CH_NEXT    0x09   // cycle selection forward
+#define IR_CH_PREV    0x07   // cycle selection backward
+
+// Direct-select each channel (numeric keys on a typical NEC remote)
+#define IR_SEL_FL     0x0C   // key "1"
+#define IR_SEL_FR     0x18   // key "2"
+#define IR_SEL_CENTER 0x5E   // key "3"
+#define IR_SEL_SUB    0x08   // key "4"
+#define IR_SEL_RL     0x1C   // key "5"
+#define IR_SEL_RR     0x5A   // key "6"
+#define IR_SEL_MASTER 0x42   // key "0"
+
+// ============================================================================
+//  Button debounce
+// ============================================================================
+struct Button {
+  uint8_t pin;
+  bool    lastStable;
+  bool    lastReading;
+  unsigned long lastChange;
+};
+Button btnVolUp{PIN_BTN_VOL_UP, HIGH, HIGH, 0};
+Button btnVolDn{PIN_BTN_VOL_DN, HIGH, HIGH, 0};
+Button btnChSel{PIN_BTN_CH_SEL, HIGH, HIGH, 0};
+Button btnMute {PIN_BTN_MUTE,   HIGH, HIGH, 0};
+Button btnPower{PIN_BTN_POWER,  HIGH, HIGH, 0};
+
+#define DEBOUNCE_MS   30
+
+// Returns true on a fresh press (falling edge, INPUT_PULLUP => pressed = LOW)
+bool buttonPressed(Button &b) {
+  bool reading = digitalRead(b.pin);
+  unsigned long now = millis();
+  if (reading != b.lastReading) {
+    b.lastReading = reading;
+    b.lastChange  = now;
+  }
+  if ((now - b.lastChange) > DEBOUNCE_MS && reading != b.lastStable) {
+    b.lastStable = reading;
+    if (b.lastStable == LOW) return true;   // just pressed
+  }
+  return false;
+}
+
+// ============================================================================
+//  PT2258 low-level helpers
+// ============================================================================
+bool pt2258Write(uint8_t data) {
+  Wire.beginTransmission(PT2258_ADDR);
+  Wire.write(data);
+  return (Wire.endTransmission() == 0);
+}
+
+bool pt2258Write2(uint8_t a, uint8_t b) {
+  Wire.beginTransmission(PT2258_ADDR);
+  Wire.write(a);
+  Wire.write(b);
+  return (Wire.endTransmission() == 0);
+}
+
+// Set attenuation (0..79 dB) for a physical channel (0..5)
+void pt2258SetChannel(uint8_t ch, uint8_t atten) {
+  if (ch >= CH_COUNT) return;
+  if (atten > 79) atten = 79;
+  uint8_t tens  = atten / 10;
+  uint8_t units = atten % 10;
+  pt2258Write2(PT_CH_10DB[ch] | tens, PT_CH_1DB[ch] | units);
+}
+
+// Set master attenuation (0..79 dB)
+void pt2258SetMaster(uint8_t atten) {
+  if (atten > 79) atten = 79;
+  uint8_t tens  = atten / 10;
+  uint8_t units = atten % 10;
+  pt2258Write2(PT2258_MASTER_10DB | tens, PT2258_MASTER_1DB | units);
+}
+
+void pt2258SetMute(bool on) {
+  pt2258Write(PT2258_MUTE | (on ? 1 : 0));
+}
+
+bool pt2258Init() {
+  delay(300);                     // PT2258 needs >=300ms after power-up
+  bool ok = pt2258Write(PT2258_CLEAR);
+  delay(10);
+  return ok;
+}
+
+// Push the full current state to the PT2258
+void pt2258ApplyAll() {
+  for (uint8_t ch = 0; ch < CH_COUNT; ch++) pt2258SetChannel(ch, cfg.chAtten[ch]);
+  pt2258SetMaster(cfg.masterAtten);
+  pt2258SetMute(cfg.muted);
+}
+
+// ============================================================================
+//  EEPROM
+// ============================================================================
+void loadSettings() {
+  EEPROM.get(EEPROM_ADDR, cfg);
+  if (cfg.magic != EEPROM_MAGIC) {
+    // First boot / invalid -> sensible defaults
+    cfg.magic       = EEPROM_MAGIC;
+    for (uint8_t i = 0; i < CH_COUNT; i++) cfg.chAtten[i] = 20;  // -20 dB
+    cfg.masterAtten = 30;                                        // -30 dB
+    cfg.muted       = 0;
+    cfg.powerOn     = 0;
+  }
+}
+
+void requestSave() { dirty = true; lastSaveReq = millis(); }
+
+void maybeSave() {
+  // Debounced EEPROM write: 2s after the last change (protects flash cycles)
+  if (dirty && (millis() - lastSaveReq > 2000)) {
+    EEPROM.put(EEPROM_ADDR, cfg);
+    dirty = false;
+  }
+}
+
+// ============================================================================
+//  Relay / power
+// ============================================================================
+void relayWrite(bool on) {
+  bool level = RELAY_ACTIVE_HIGH ? on : !on;
+  digitalWrite(PIN_RELAY, level ? HIGH : LOW);
+}
+
+void applyPower() {
+  relayWrite(cfg.powerOn);
+  if (cfg.powerOn) {
+    // Re-init the volume IC each time we power the audio stage
+    pt2258Init();
+    pt2258ApplyAll();
+  } else {
+    pt2258SetMute(true);   // safety: mute output when powering down
+  }
+}
+
+void togglePower() {
+  cfg.powerOn = !cfg.powerOn;
+  applyPower();
+  requestSave();
+}
+
+// ============================================================================
+//  Volume actions
+// ============================================================================
+uint8_t* selectedAtten() {
+  return (selection == SEL_MASTER) ? &cfg.masterAtten : &cfg.chAtten[selection];
+}
+
+void applySelected() {
+  if (selection == SEL_MASTER) pt2258SetMaster(cfg.masterAtten);
+  else                         pt2258SetChannel(selection, cfg.chAtten[selection]);
+}
+
+void volumeUp() {                 // louder => LESS attenuation
+  if (!cfg.powerOn) return;
+  uint8_t* a = selectedAtten();
+  if (*a > 0) (*a)--;
+  applySelected();
+  requestSave();
+}
+
+void volumeDown() {               // quieter => MORE attenuation
+  if (!cfg.powerOn) return;
+  uint8_t* a = selectedAtten();
+  if (*a < 79) (*a)++;
+  applySelected();
+  requestSave();
+}
+
+void cycleSelection(bool forward) {
+  if (forward) selection = (selection + 1) % SEL_COUNT;
+  else         selection = (selection + SEL_COUNT - 1) % SEL_COUNT;
+}
+
+void toggleMute() {
+  if (!cfg.powerOn) return;
+  cfg.muted = !cfg.muted;
+  pt2258SetMute(cfg.muted);
+  requestSave();
+}
+
+void selectChannel(uint8_t sel) {
+  if (sel < SEL_COUNT) selection = sel;
+}
+
+// ============================================================================
+//  Voltage divider
+// ============================================================================
+void readVoltageDivider() {
+  int v = analogRead(PIN_VDIV);
+  uint8_t band = 4;
+  for (uint8_t i = 0; i < 5; i++) {
+    if (v <= VDIV_THRESHOLD[i]) { band = i; break; }
+  }
+  vdivBand = band;
+}
+
+// ============================================================================
+//  OLED rendering
+// ============================================================================
+// Convert attenuation (0..79) to a displayed dB value (0..-79)
+int attenToDb(uint8_t a) { return -(int)a; }
+
+void drawUI() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // ---- Header: power + source label ----
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print(cfg.powerOn ? F("ON ") : F("OFF"));
+  display.print(F("  SRC:"));
+  display.print(VDIV_LABELS[vdivBand]);
+
+  if (cfg.muted) {
+    display.setCursor(104, 0);
+    display.print(F("MUTE"));
+  }
+  display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+
+  // ---- Selected channel name (big) ----
+  display.setTextSize(2);
+  display.setCursor(0, 16);
+  display.print(CH_NAME[selection]);
+
+  // ---- dB value (big) ----
+  uint8_t a = (selection == SEL_MASTER) ? cfg.masterAtten : cfg.chAtten[selection];
+  display.setTextSize(2);
+  display.setCursor(0, 36);
+  display.print(attenToDb(a));
+  display.print(F(" dB"));
+
+  // ---- Volume bar (0 dB full .. -79 dB empty) ----
+  int barW = map(79 - a, 0, 79, 0, 124);
+  display.drawRect(0, 56, 128, 8, SSD1306_WHITE);
+  if (barW > 0) display.fillRect(2, 58, barW, 4, SSD1306_WHITE);
+
+  display.display();
+}
+
+// ============================================================================
+//  IR handling
+// ============================================================================
+bool irLearnMode = false;
+
+void handleIrCommand(uint16_t cmd) {
+  switch (cmd) {
+    case IR_POWER:      togglePower();            break;
+    case IR_MUTE:       toggleMute();             break;
+    case IR_VOL_UP:     volumeUp();               break;
+    case IR_VOL_DN:     volumeDown();             break;
+    case IR_CH_NEXT:    cycleSelection(true);     break;
+    case IR_CH_PREV:    cycleSelection(false);    break;
+    case IR_SEL_FL:     selectChannel(CH_FL);     break;
+    case IR_SEL_FR:     selectChannel(CH_FR);     break;
+    case IR_SEL_CENTER: selectChannel(CH_CENTER); break;
+    case IR_SEL_SUB:    selectChannel(CH_SUB);    break;
+    case IR_SEL_RL:     selectChannel(CH_RL);     break;
+    case IR_SEL_RR:     selectChannel(CH_RR);     break;
+    case IR_SEL_MASTER: selectChannel(SEL_MASTER);break;
+    default: break;
+  }
+}
+
+void serviceIR() {
+  if (!IrReceiver.decode()) return;
+
+  uint16_t cmd     = IrReceiver.decodedIRData.command;
+  uint16_t address = IrReceiver.decodedIRData.address;
+  bool     repeat  = IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT;
+
+  if (irLearnMode) {
+    // Print codes so the user can copy them into the #defines above
+    Serial.print(F("[LEARN] addr=0x"));
+    Serial.print(address, HEX);
+    Serial.print(F("  cmd=0x"));
+    Serial.print(cmd, HEX);
+    Serial.print(F("  proto="));
+    Serial.println(getProtocolString(IrReceiver.decodedIRData.protocol));
+  } else {
+    // Allow repeat only for volume keys (hold to ramp)
+    if (repeat) {
+      if (cmd == 0) cmd = 0xFFFF;  // some libs report 0 on repeat
+    }
+    handleIrCommand(cmd);
+  }
+
+  IrReceiver.resume();
+}
+
+// ============================================================================
+//  Serial command console
+// ============================================================================
+void printHelp() {
+  Serial.println(F("\n=== 5.1 PT2258 Controller ==="));
+  Serial.println(F("Serial commands:"));
+  Serial.println(F("  L : toggle IR LEARN mode (prints remote codes)"));
+  Serial.println(F("  P : toggle power/relay"));
+  Serial.println(F("  M : toggle mute"));
+  Serial.println(F("  + : volume up (selected)"));
+  Serial.println(F("  - : volume down (selected)"));
+  Serial.println(F("  > : next channel   < : prev channel"));
+  Serial.println(F("  ? : this help"));
+}
+
+void serviceSerial() {
+  if (!Serial.available()) return;
+  char c = Serial.read();
+  switch (c) {
+    case 'L': case 'l':
+      irLearnMode = !irLearnMode;
+      Serial.print(F("IR learn mode: "));
+      Serial.println(irLearnMode ? F("ON  (press remote keys)") : F("OFF"));
+      break;
+    case 'P': case 'p': togglePower();         break;
+    case 'M': case 'm': toggleMute();          break;
+    case '+':           volumeUp();            break;
+    case '-':           volumeDown();          break;
+    case '>':           cycleSelection(true);  break;
+    case '<':           cycleSelection(false); break;
+    case '?':           printHelp();           break;
+    default: break;
+  }
+}
+
+// ============================================================================
+//  SETUP
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_BTN_VOL_UP, INPUT_PULLUP);
+  pinMode(PIN_BTN_VOL_DN, INPUT_PULLUP);
+  pinMode(PIN_BTN_CH_SEL, INPUT_PULLUP);
+  pinMode(PIN_BTN_MUTE,   INPUT_PULLUP);
+  pinMode(PIN_BTN_POWER,  INPUT_PULLUP);
+  pinMode(PIN_RELAY,      OUTPUT);
+  relayWrite(false);
+
+  Wire.begin();
+  Wire.setClock(100000);   // PT2258 is happy at 100kHz
+
+  // OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println(F("SSD1306 not found (check wiring/address)"));
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println(F("5.1 PT2258 Controller"));
+  display.println(F("Booting..."));
+  display.display();
+
+  // IR receiver
+  IrReceiver.begin(PIN_IR_RECV, ENABLE_LED_FEEDBACK);
+
+  // Config + volume IC
+  loadSettings();
+  pt2258Init();
+  applyPower();          // restores relay + pushes all attenuations
+  pt2258ApplyAll();
+
+  printHelp();
+  delay(400);
+}
+
+// ============================================================================
+//  LOOP
+// ============================================================================
+void loop() {
+  // ---- Buttons ----
+  if (buttonPressed(btnPower)) togglePower();
+
+  if (buttonPressed(btnChSel)) cycleSelection(true);
+  if (buttonPressed(btnMute))  toggleMute();
+  if (buttonPressed(btnVolUp)) volumeUp();
+  if (buttonPressed(btnVolDn)) volumeDown();
+
+  // ---- IR + Serial ----
+  serviceIR();
+  serviceSerial();
+
+  // ---- Voltage divider ----
+  static unsigned long lastVdiv = 0;
+  if (millis() - lastVdiv > 150) { readVoltageDivider(); lastVdiv = millis(); }
+
+  // ---- Display ----
+  static unsigned long lastDraw = 0;
+  if (millis() - lastDraw > 60) { drawUI(); lastDraw = millis(); }
+
+  // ---- Persist ----
+  maybeSave();
+}
