@@ -1,5 +1,9 @@
 # Digital 5.1 Channel Volume Controller — PT2258 + Arduino Nano
 
+> **This is the "GR8-ATA" custom-splash variant.** It is identical to the
+> default sketch except the boot screen shows **"GR8-ATA"**. Upload this one for
+> the custom logo, or the sibling folder for the default splash.
+
 Full firmware for a 6-channel (5.1) digital volume controller built around the
 **PT2258** electronic volume IC, an **Arduino Nano**, and an **SSD1306 128x64
 OLED**. Control via 5 push buttons or an **IR remote** (NEC). A 5-stage voltage

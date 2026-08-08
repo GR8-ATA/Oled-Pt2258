@@ -582,27 +582,26 @@ void serviceSerial() {
 }
 
 // ============================================================================
-//  Startup splash
+//  Startup splash  (CUSTOM "GR8-ATA" branding)
 // ============================================================================
 void drawSplash() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
-  // Framed title
-  display.drawRoundRect(2, 4, 124, 40, 4, SSD1306_WHITE);
-  display.setTextSize(2);
-  display.setCursor(30, 10);
-  display.print(F("5.1 CH"));
-  display.setTextSize(1);
-  display.setCursor(14, 30);
-  display.print(F("DIGITAL VOLUME"));
+  // Big custom logo text, centered
+  display.setTextSize(3);
+  display.setCursor(1, 12);
+  display.print(F("GR8-ATA"));
 
-  display.setCursor(10, 50);
-  display.print(F("PT2258 . Nano"));
+  // Underline + subtitle
+  display.drawFastHLine(4, 40, 120, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(6, 48);
+  display.print(F("5.1 DIGITAL VOLUME"));
 
   // little VU-style bars
   for (uint8_t i = 0; i < 6; i++) {
-    display.fillRect(96 + i * 5, 52 - (i * 2), 3, 4 + i * 2, SSD1306_WHITE);
+    display.fillRect(96 + i * 5, 60 - (i * 2), 3, 2 + i * 2, SSD1306_WHITE);
   }
   display.display();
 }
