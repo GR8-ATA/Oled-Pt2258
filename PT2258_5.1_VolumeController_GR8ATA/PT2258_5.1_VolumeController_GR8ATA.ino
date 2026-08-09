@@ -35,7 +35,8 @@
 #include <Adafruit_SSD1306.h>
 
 // ---- IRremote v4.x -----------------------------------------------------------
-#define DECODE_NEC          // enable only NEC to save flash
+#define DECODE_NEC          // keep NEC support
+#define DECODE_SAMSUNG      // Samsung TV remotes use the SAMSUNG protocol
 #include <IRremote.hpp>
 
 // ============================================================================
@@ -169,27 +170,27 @@ unsigned long lastSaveReq = 0;
 unsigned long lastActivity = 0;   // for auto standby
 
 // ============================================================================
-//  IR CODE MAP  (NEC command bytes)
-//  These are PLACEHOLDER values for a common NEC remote.
-//  Use the Serial "learning mode" (send 'L') to print your remote's codes,
-//  then paste the printed command values below and re-upload.
+//  IR CODE MAP  (Samsung TV remote -- SAMSUNG protocol, address 0x0707)
+//  These are the STANDARD Samsung TV command codes. If a key on YOUR remote
+//  reports a different value, use the Serial "learning mode" (send 'L') to
+//  print it, then paste the value below and re-upload.
 // ============================================================================
-#define IR_POWER      0x45
-#define IR_MUTE       0x47
-#define IR_VOL_UP     0x40
-#define IR_VOL_DN     0x19
-#define IR_CH_NEXT    0x09   // cycle selection forward
-#define IR_CH_PREV    0x07   // cycle selection backward
-#define IR_PRESET     0x16   // cycle tone presets (FLAT/MOVIE/MUSIC/NIGHT)
+#define IR_POWER      0x02   // POWER
+#define IR_MUTE       0x0F   // MUTE
+#define IR_VOL_UP     0x07   // VOL +
+#define IR_VOL_DN     0x0B   // VOL -
+#define IR_CH_NEXT    0x12   // CH ^  (next channel selection)
+#define IR_CH_PREV    0x10   // CH v  (prev channel selection)
+#define IR_PRESET     0x01   // SOURCE (cycle tone presets) - relearn if needed
 
-// Direct-select each channel (numeric keys on a typical NEC remote)
-#define IR_SEL_FL     0x0C   // key "1"
-#define IR_SEL_FR     0x18   // key "2"
-#define IR_SEL_CENTER 0x5E   // key "3"
+// Direct-select each channel (number keys 1..6 ; MASTER = key "0")
+#define IR_SEL_FL     0x04   // key "1"
+#define IR_SEL_FR     0x05   // key "2"
+#define IR_SEL_CENTER 0x06   // key "3"
 #define IR_SEL_SUB    0x08   // key "4"
-#define IR_SEL_RL     0x1C   // key "5"
-#define IR_SEL_RR     0x5A   // key "6"
-#define IR_SEL_MASTER 0x42   // key "0"
+#define IR_SEL_RL     0x09   // key "5"
+#define IR_SEL_RR     0x0A   // key "6"
+#define IR_SEL_MASTER 0x11   // key "0"
 
 // ============================================================================
 //  Button debounce
@@ -607,6 +608,32 @@ void drawSplash() {
 }
 
 // ============================================================================
+//  I2C / OLED helpers
+// ============================================================================
+// Scan the I2C bus and print found addresses (debug aid on the Serial Monitor)
+void i2cScan() {
+  Serial.println(F("I2C scan:"));
+  uint8_t count = 0;
+  for (uint8_t a = 1; a < 127; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) {
+      Serial.print(F("  found device at 0x"));
+      Serial.println(a, HEX);
+      count++;
+    }
+  }
+  if (count == 0)
+    Serial.println(F("  (none found - check SDA/SCL wiring, 3.3-5V power, GND)"));
+}
+
+// Start the OLED, trying the two common addresses 0x3C then 0x3D
+bool oledBegin() {
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { Serial.println(F("OLED @0x3C")); return true; }
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) { Serial.println(F("OLED @0x3D")); return true; }
+  return false;
+}
+
+// ============================================================================
 //  SETUP
 // ============================================================================
 void setup() {
@@ -628,9 +655,11 @@ void setup() {
   Wire.begin();
   Wire.setClock(100000);   // PT2258 is happy at 100kHz
 
-  // OLED
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println(F("SSD1306 not found (check wiring/address)"));
+  // OLED - scan the bus (debug) then try 0x3C and 0x3D
+  i2cScan();
+  if (!oledBegin()) {
+    Serial.println(F("SSD1306 not found at 0x3C or 0x3D"));
+    Serial.println(F("  -> check: SDA=A4, SCL=A5, VCC, GND, and module address"));
   }
 
   // Startup splash screen
