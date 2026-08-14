@@ -109,7 +109,7 @@ const char N_SUB[] PROGMEM = "SUB";
 const char N_RL[]  PROGMEM = "REAR L";
 const char N_RR[]  PROGMEM = "REAR R";
 const char N_MST[] PROGMEM = "MASTER";
-const char* const CH_NAME[SEL_COUNT] PROGMEM = {
+const char* const CH_NAME[SEL_COUNT] = {
   N_FL, N_FR, N_CEN, N_SUB, N_RL, N_RR, N_MST
 };
 
@@ -124,7 +124,7 @@ const char P_FLAT[]  PROGMEM = "FLAT";
 const char P_MOVIE[] PROGMEM = "MOVIE";
 const char P_MUSIC[] PROGMEM = "MUSIC";
 const char P_NIGHT[] PROGMEM = "NIGHT";
-const char* const PRESET_NAME[PRESET_COUNT] PROGMEM = {
+const char* const PRESET_NAME[PRESET_COUNT] = {
   P_FLAT, P_MOVIE, P_MUSIC, P_NIGHT
 };
 
@@ -240,7 +240,7 @@ bool buttonPressed(Button &b) {
 
 // Copy a PROGMEM string-table entry into a small RAM buffer for printing
 const char* pflash(const char* const table[], uint8_t i) {
-  strcpy_P(g_strbuf, (PGM_P)pgm_read_ptr(&table[i]));
+  strcpy_P(g_strbuf, (PGM_P)table[i]);
   return g_strbuf;
 }
 
