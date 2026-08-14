@@ -62,9 +62,9 @@ Both are identical otherwise — pick whichever splash you prefer and upload it.
 |---|---|
 | I2C SDA (PT2258 + OLED) | **A4** |
 | I2C SCL (PT2258 + OLED) | **A5** |
-| IR receiver OUT | **D2** |
+| IR receiver OUT | **D4** |
 | Button — Volume Up | **D3** → GND |
-| Button — Volume Down | **D4** → GND |
+| Button — Volume Down | **D2** → GND |
 | Button — Channel Select | **D5** → GND |
 | Button — Mute | **D6** → GND |
 | Button — Power | **D7** → GND |

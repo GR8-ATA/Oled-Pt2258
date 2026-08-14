@@ -37,15 +37,16 @@
 // ---- IRremote v4.x -----------------------------------------------------------
 #define DECODE_NEC          // keep NEC support
 #define DECODE_SAMSUNG      // Samsung TV remotes use the SAMSUNG protocol
+#define RAW_BUFFER_LENGTH 80  // smaller IR raw buffer -> saves RAM on the Nano
 #include <IRremote.hpp>
 
 // ============================================================================
 //  PIN MAP  (Arduino Nano)
 // ============================================================================
 //  I2C: A4 = SDA, A5 = SCL  (shared by PT2258 + OLED)
-#define PIN_IR_RECV      2   // IR receiver signal (TSOP1738 / VS1838B)
+#define PIN_IR_RECV      4   // IR receiver signal (TSOP1738 / VS1838B) -> D4
 #define PIN_BTN_VOL_UP   3
-#define PIN_BTN_VOL_DN   4
+#define PIN_BTN_VOL_DN   2   // moved to D2 (D4 is now used by the IR receiver)
 #define PIN_BTN_CH_SEL   5
 #define PIN_BTN_MUTE     6
 #define PIN_BTN_POWER    7
@@ -100,14 +101,16 @@ enum { CH_FL = 0, CH_FR, CH_CENTER, CH_SUB, CH_RL, CH_RR, CH_COUNT };
 #define SEL_MASTER   CH_COUNT      // 6 == master
 #define SEL_COUNT    (CH_COUNT + 1)
 
-const char* CH_NAME[SEL_COUNT] = {
-  "FRONT L",   // CH_FL
-  "FRONT R",   // CH_FR
-  "CENTER",    // CH_CENTER
-  "SUB",       // CH_SUB
-  "REAR L",    // CH_RL
-  "REAR R",    // CH_RR
-  "MASTER"     // SEL_MASTER
+// Channel names in flash (PROGMEM) to save RAM
+const char N_FL[]  PROGMEM = "FRONT L";
+const char N_FR[]  PROGMEM = "FRONT R";
+const char N_CEN[] PROGMEM = "CENTER";
+const char N_SUB[] PROGMEM = "SUB";
+const char N_RL[]  PROGMEM = "REAR L";
+const char N_RR[]  PROGMEM = "REAR R";
+const char N_MST[] PROGMEM = "MASTER";
+const char* const CH_NAME[SEL_COUNT] PROGMEM = {
+  N_FL, N_FR, N_CEN, N_SUB, N_RL, N_RR, N_MST
 };
 
 // ============================================================================
@@ -117,7 +120,13 @@ const char* CH_NAME[SEL_COUNT] = {
 // ============================================================================
 enum { PRESET_FLAT = 0, PRESET_MOVIE, PRESET_MUSIC, PRESET_NIGHT, PRESET_COUNT };
 
-const char* PRESET_NAME[PRESET_COUNT] = { "FLAT", "MOVIE", "MUSIC", "NIGHT" };
+const char P_FLAT[]  PROGMEM = "FLAT";
+const char P_MOVIE[] PROGMEM = "MOVIE";
+const char P_MUSIC[] PROGMEM = "MUSIC";
+const char P_NIGHT[] PROGMEM = "NIGHT";
+const char* const PRESET_NAME[PRESET_COUNT] PROGMEM = {
+  P_FLAT, P_MOVIE, P_MUSIC, P_NIGHT
+};
 
 const uint8_t PRESET_ATTEN[PRESET_COUNT][CH_COUNT] = {
   //  FL  FR  CEN SUB  RL  RR
@@ -133,16 +142,20 @@ const uint8_t PRESET_ATTEN[PRESET_COUNT][CH_COUNT] = {
 //  Reads A0 (0..1023). Five roughly-even bands are decoded to a label.
 //  Example use: input source selector, listening mode, etc.
 // ============================================================================
-const char* VDIV_LABELS[5] = {
-  "AUX",       // ~0.0 - 1.0 V
-  "BLUETOOTH", // ~1.0 - 2.0 V
-  "USB",       // ~2.0 - 3.0 V
-  "OPTICAL",   // ~3.0 - 4.0 V
-  "COAXIAL"    // ~4.0 - 5.0 V
+const char V_AUX[] PROGMEM = "AUX";
+const char V_BT[]  PROGMEM = "BLUETOOTH";
+const char V_USB[] PROGMEM = "USB";
+const char V_OPT[] PROGMEM = "OPTICAL";
+const char V_COX[] PROGMEM = "COAXIAL";
+const char* const VDIV_LABELS[5] PROGMEM = {
+  V_AUX, V_BT, V_USB, V_OPT, V_COX
 };
 // ADC thresholds (0..1023). Value below threshold[i] -> band i.
 // Defaults assume 5 evenly spaced steps of a resistor ladder.
 const int VDIV_THRESHOLD[5] = { 102, 307, 512, 717, 1023 };
+
+// Small RAM buffer for copying PROGMEM strings before printing
+char g_strbuf[12];
 
 // ============================================================================
 //  Persisted settings (EEPROM)
@@ -168,6 +181,7 @@ uint8_t vdivBand  = 0;            // decoded voltage divider band
 bool    dirty     = false;        // settings changed -> schedule EEPROM save
 unsigned long lastSaveReq = 0;
 unsigned long lastActivity = 0;   // for auto standby
+bool    oledOk    = false;        // true only if the SSD1306 initialised
 
 // ============================================================================
 //  IR CODE MAP  (Samsung TV remote -- SAMSUNG protocol, address 0x0707)
@@ -222,6 +236,12 @@ bool buttonPressed(Button &b) {
     if (b.lastStable == LOW) return true;   // just pressed
   }
   return false;
+}
+
+// Copy a PROGMEM string-table entry into a small RAM buffer for printing
+const char* pflash(const char* const table[], uint8_t i) {
+  strcpy_P(g_strbuf, (PGM_P)pgm_read_ptr(&table[i]));
+  return g_strbuf;
 }
 
 // ============================================================================
@@ -457,7 +477,7 @@ void drawUI() {
   display.setCursor(0, 0);
   display.print(cfg.powerOn ? F("ON ") : F("OFF"));
   display.print(F("  SRC:"));
-  display.print(VDIV_LABELS[vdivBand]);
+  display.print(pflash(VDIV_LABELS, vdivBand));
 
   if (cfg.muted) {
     display.setCursor(104, 0);
@@ -468,7 +488,7 @@ void drawUI() {
   // ---- Selected channel name (big) ----
   display.setTextSize(2);
   display.setCursor(0, 16);
-  display.print(CH_NAME[selection]);
+  display.print(pflash(CH_NAME, selection));
 
   // ---- dB value (big) ----
   uint8_t a = (selection == SEL_MASTER) ? cfg.masterAtten : cfg.chAtten[selection];
@@ -480,7 +500,7 @@ void drawUI() {
   // ---- Active tone preset (small, top-right of value area) ----
   display.setTextSize(1);
   display.setCursor(92, 16);
-  display.print(PRESET_NAME[cfg.preset]);
+  display.print(pflash(PRESET_NAME, cfg.preset));
 
   // ---- Volume bar (0 dB full .. -79 dB empty) ----
   int barW = map(79 - a, 0, 79, 0, 124);
@@ -574,8 +594,7 @@ void serviceSerial() {
     case '<':           cycleSelection(false); break;
     case 'T': case 't':
       cyclePreset();
-      Serial.print(F("Preset: "));
-      Serial.println(PRESET_NAME[cfg.preset]);
+      Serial.print(F("Preset: ")); Serial.println(pflash(PRESET_NAME, cfg.preset));
       break;
     case '?':           printHelp();           break;
     default: break;
@@ -657,13 +676,14 @@ void setup() {
 
   // OLED - scan the bus (debug) then try 0x3C and 0x3D
   i2cScan();
-  if (!oledBegin()) {
+  oledOk = oledBegin();
+  if (!oledOk) {
     Serial.println(F("SSD1306 not found at 0x3C or 0x3D"));
     Serial.println(F("  -> check: SDA=A4, SCL=A5, VCC, GND, and module address"));
   }
 
-  // Startup splash screen
-  drawSplash();
+  // Startup splash screen (only if the OLED initialised)
+  if (oledOk) drawSplash();
 
   // IR receiver
   IrReceiver.begin(PIN_IR_RECV, ENABLE_LED_FEEDBACK);
@@ -704,7 +724,7 @@ void loop() {
 
   // ---- Display ----
   static unsigned long lastDraw = 0;
-  if (millis() - lastDraw > 60) { drawUI(); lastDraw = millis(); }
+  if (oledOk && millis() - lastDraw > 60) { drawUI(); lastDraw = millis(); }
 
   // ---- Persist + auto standby ----
   maybeSave();
