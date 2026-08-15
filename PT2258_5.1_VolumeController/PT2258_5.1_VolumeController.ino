@@ -71,6 +71,7 @@
 #define SCREEN_HEIGHT  64
 #define OLED_RESET     -1
 #define OLED_ADDR      0x3C
+#define USE_DISPLAY    1   // set to 0 to run WITHOUT the OLED (diagnostic isolation)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ============================================================================
@@ -247,8 +248,9 @@ const char* pflash(const char* const table[], uint8_t i) {
 // Report free SRAM at runtime (diagnostic)
 int freeRam() {
   extern int __heap_start, *__brkval;
-  int v;
-  return (int)&v - (__brkval == 0 ? (int)&__heap_start : (int)__brkval);
+  char top;
+  uintptr_t heap = (__brkval == 0) ? (uintptr_t)&__heap_start : (uintptr_t)__brkval;
+  return (int)((uintptr_t)&top - heap);
 }
 
 // ============================================================================
@@ -685,14 +687,17 @@ void setup() {
 
   // OLED - scan the bus (debug) then try 0x3C and 0x3D
   i2cScan();
+#if USE_DISPLAY
   oledOk = oledBegin();
   if (!oledOk) {
     Serial.println(F("SSD1306 not found at 0x3C or 0x3D"));
     Serial.println(F("  -> check: SDA=A4, SCL=A5, VCC, GND, and module address"));
   }
-
-  // Startup splash screen (only if the OLED initialised)
-  if (oledOk) drawSplash();
+  if (oledOk) drawSplash();   // splash only if the OLED initialised
+#else
+  oledOk = false;
+  Serial.println(F("[DISPLAY DISABLED for diagnosis]"));
+#endif
 
   // IR receiver
   IrReceiver.begin(PIN_IR_RECV, ENABLE_LED_FEEDBACK);
@@ -712,7 +717,7 @@ void setup() {
 
   printHelp();
   lastActivity = millis();
-  Serial.println(F("setup complete"));
+  Serial.print(F("setup complete  free=")); Serial.println(freeRam());
 }
 
 // ============================================================================
