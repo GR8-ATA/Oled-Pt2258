@@ -244,6 +244,13 @@ const char* pflash(const char* const table[], uint8_t i) {
   return g_strbuf;
 }
 
+// Report free SRAM at runtime (diagnostic)
+int freeRam() {
+  extern int __heap_start, *__brkval;
+  int v;
+  return (int)&v - (__brkval == 0 ? (int)&__heap_start : (int)__brkval);
+}
+
 // ============================================================================
 //  PT2258 low-level helpers
 // ============================================================================
@@ -673,6 +680,7 @@ void setup() {
 
   Wire.begin();
   Wire.setClock(100000);   // PT2258 is happy at 100kHz
+  Wire.setWireTimeout(3000, true);   // auto-recover if the I2C bus stalls
 
   // OLED - scan the bus (debug) then try 0x3C and 0x3D
   i2cScan();
@@ -724,6 +732,15 @@ void loop() {
   // ---- IR + Serial ----
   serviceIR();
   serviceSerial();
+
+  // Diagnostic heartbeat: proves the loop is alive + reports free RAM
+  static unsigned long lastHb = 0;
+  static uint16_t hbCount = 0;
+  if (millis() - lastHb > 1000) {
+    lastHb = millis();
+    Serial.print(F("hb ")); Serial.print(hbCount++);
+    Serial.print(F(" free=")); Serial.println(freeRam());
+  }
 
   // ---- Voltage divider ----
   static unsigned long lastVdiv = 0;
