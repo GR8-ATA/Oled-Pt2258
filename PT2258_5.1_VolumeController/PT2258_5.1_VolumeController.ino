@@ -160,7 +160,7 @@ char g_strbuf[12];
 // ============================================================================
 //  Persisted settings (EEPROM)
 // ============================================================================
-#define EEPROM_MAGIC   0x52        // bump to reset stored config
+#define EEPROM_MAGIC   0x53        // bump to reset stored config
 #define EEPROM_ADDR    0
 
 struct Settings {
@@ -303,10 +303,10 @@ void loadSettings() {
   if (cfg.magic != EEPROM_MAGIC) {
     // First boot / invalid -> sensible defaults
     cfg.magic       = EEPROM_MAGIC;
-    for (uint8_t i = 0; i < CH_COUNT; i++) cfg.chAtten[i] = 20;  // -20 dB
-    cfg.masterAtten = 30;                                        // -30 dB
+    for (uint8_t i = 0; i < CH_COUNT; i++) cfg.chAtten[i] = 0;   // 0 dB (unity)
+    cfg.masterAtten = 20;                                        // -20 dB
     cfg.muted       = 0;
-    cfg.powerOn     = 0;
+    cfg.powerOn     = 1;   // start powered ON so volume works out of the box
     cfg.preset      = PRESET_FLAT;
   }
 }
@@ -691,9 +691,7 @@ void setup() {
 
   // Config + volume IC
   loadSettings();
-  pt2258Init();
-  applyPower();          // restores relay + pushes all attenuations
-  pt2258ApplyAll();
+  applyPower();          // powers relay + inits PT2258 + pushes all attenuations
 
   printHelp();
   lastActivity = millis();
