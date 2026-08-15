@@ -689,13 +689,22 @@ void setup() {
   // IR receiver
   IrReceiver.begin(PIN_IR_RECV, ENABLE_LED_FEEDBACK);
 
-  // Config + volume IC
+  // Volume IC first; the relay stays OFF during init for a clean soft-start
   loadSettings();
-  applyPower();          // powers relay + inits PT2258 + pushes all attenuations
+  Serial.println(F("PT2258 init..."));
+  pt2258Init();
+  pt2258ApplyAll();
+  Serial.println(F("PT2258 ready"));
+
+  delay(1200);           // hold the splash briefly
+
+  // Energize the power relay LAST, so its inrush can't reset the board mid-init
+  Serial.println(F("relay -> power"));
+  relayWrite(cfg.powerOn);
 
   printHelp();
   lastActivity = millis();
-  delay(1800);           // hold the splash briefly
+  Serial.println(F("setup complete"));
 }
 
 // ============================================================================
