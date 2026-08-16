@@ -71,6 +71,7 @@
 #define SCREEN_HEIGHT  64
 #define OLED_RESET     -1
 #define OLED_ADDR      0x3C
+#define USE_DISPLAY    1   // set to 0 to run WITHOUT the OLED (diagnostic isolation)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ============================================================================
@@ -109,7 +110,7 @@ const char N_SUB[] PROGMEM = "SUB";
 const char N_RL[]  PROGMEM = "REAR L";
 const char N_RR[]  PROGMEM = "REAR R";
 const char N_MST[] PROGMEM = "MASTER";
-const char* const CH_NAME[SEL_COUNT] PROGMEM = {
+const char* const CH_NAME[SEL_COUNT] = {
   N_FL, N_FR, N_CEN, N_SUB, N_RL, N_RR, N_MST
 };
 
@@ -124,7 +125,7 @@ const char P_FLAT[]  PROGMEM = "FLAT";
 const char P_MOVIE[] PROGMEM = "MOVIE";
 const char P_MUSIC[] PROGMEM = "MUSIC";
 const char P_NIGHT[] PROGMEM = "NIGHT";
-const char* const PRESET_NAME[PRESET_COUNT] PROGMEM = {
+const char* const PRESET_NAME[PRESET_COUNT] = {
   P_FLAT, P_MOVIE, P_MUSIC, P_NIGHT
 };
 
@@ -160,7 +161,7 @@ char g_strbuf[12];
 // ============================================================================
 //  Persisted settings (EEPROM)
 // ============================================================================
-#define EEPROM_MAGIC   0x52        // bump to reset stored config
+#define EEPROM_MAGIC   0x53        // bump to reset stored config
 #define EEPROM_ADDR    0
 
 struct Settings {
@@ -240,8 +241,16 @@ bool buttonPressed(Button &b) {
 
 // Copy a PROGMEM string-table entry into a small RAM buffer for printing
 const char* pflash(const char* const table[], uint8_t i) {
-  strcpy_P(g_strbuf, (PGM_P)pgm_read_ptr(&table[i]));
+  strcpy_P(g_strbuf, (PGM_P)table[i]);
   return g_strbuf;
+}
+
+// Report free SRAM at runtime (diagnostic)
+int freeRam() {
+  extern int __heap_start, *__brkval;
+  char top;
+  uintptr_t heap = (__brkval == 0) ? (uintptr_t)&__heap_start : (uintptr_t)__brkval;
+  return (int)((uintptr_t)&top - heap);
 }
 
 // ============================================================================
@@ -303,10 +312,10 @@ void loadSettings() {
   if (cfg.magic != EEPROM_MAGIC) {
     // First boot / invalid -> sensible defaults
     cfg.magic       = EEPROM_MAGIC;
-    for (uint8_t i = 0; i < CH_COUNT; i++) cfg.chAtten[i] = 20;  // -20 dB
-    cfg.masterAtten = 30;                                        // -30 dB
+    for (uint8_t i = 0; i < CH_COUNT; i++) cfg.chAtten[i] = 0;   // 0 dB (unity)
+    cfg.masterAtten = 20;                                        // -20 dB
     cfg.muted       = 0;
-    cfg.powerOn     = 0;
+    cfg.powerOn     = 1;   // start powered ON so volume works out of the box
     cfg.preset      = PRESET_FLAT;
   }
 }
@@ -673,30 +682,41 @@ void setup() {
 
   Wire.begin();
   Wire.setClock(100000);   // PT2258 is happy at 100kHz
+  Wire.setWireTimeout(3000, true);   // auto-recover if the I2C bus stalls
 
   // OLED - scan the bus (debug) then try 0x3C and 0x3D
   i2cScan();
+#if USE_DISPLAY
   oledOk = oledBegin();
   if (!oledOk) {
     Serial.println(F("SSD1306 not found at 0x3C or 0x3D"));
     Serial.println(F("  -> check: SDA=A4, SCL=A5, VCC, GND, and module address"));
   }
-
-  // Startup splash screen (only if the OLED initialised)
-  if (oledOk) drawSplash();
+  if (oledOk) drawSplash();   // splash only if the OLED initialised
+#else
+  oledOk = false;
+  Serial.println(F("[DISPLAY DISABLED for diagnosis]"));
+#endif
 
   // IR receiver
   IrReceiver.begin(PIN_IR_RECV, ENABLE_LED_FEEDBACK);
 
-  // Config + volume IC
+  // Volume IC first; the relay stays OFF during init for a clean soft-start
   loadSettings();
+  Serial.println(F("PT2258 init..."));
   pt2258Init();
-  applyPower();          // restores relay + pushes all attenuations
   pt2258ApplyAll();
+  Serial.println(F("PT2258 ready"));
+
+  delay(1200);           // hold the splash briefly
+
+  // Energize the power relay LAST, so its inrush can't reset the board mid-init
+  Serial.println(F("relay -> power"));
+  relayWrite(cfg.powerOn);
 
   printHelp();
   lastActivity = millis();
-  delay(1800);           // hold the splash briefly
+  Serial.print(F("setup complete  free=")); Serial.println(freeRam());
 }
 
 // ============================================================================
@@ -717,6 +737,15 @@ void loop() {
   // ---- IR + Serial ----
   serviceIR();
   serviceSerial();
+
+  // Diagnostic heartbeat: proves the loop is alive + reports free RAM
+  static unsigned long lastHb = 0;
+  static uint16_t hbCount = 0;
+  if (millis() - lastHb > 1000) {
+    lastHb = millis();
+    Serial.print(F("hb ")); Serial.print(hbCount++);
+    Serial.print(F(" free=")); Serial.println(freeRam());
+  }
 
   // ---- Voltage divider ----
   static unsigned long lastVdiv = 0;
